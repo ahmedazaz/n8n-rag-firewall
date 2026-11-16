@@ -1,0 +1,451 @@
+{
+  "id": "IngestFirewallA1",
+  "name": "A — Ingestion & Semantic Firewall",
+  "nodes": [
+    {
+      "id": "3abd81ae-3dae-59e8-b979-75e6906f348b",
+      "name": "Manual Trigger",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        300
+      ],
+      "parameters": {}
+    },
+    {
+      "id": "20a61031-87b4-5d55-b1ca-c4f99fd819d5",
+      "name": "Read Transcripts File",
+      "type": "n8n-nodes-base.readWriteFile",
+      "typeVersion": 1,
+      "position": [
+        220,
+        300
+      ],
+      "parameters": {
+        "operation": "read",
+        "fileSelector": "/data/mock_transcripts.json",
+        "options": {}
+      }
+    },
+    {
+      "id": "9efbe07b-f824-5d85-97ed-16677851abcb",
+      "name": "Parse JSON File",
+      "type": "n8n-nodes-base.extractFromFile",
+      "typeVersion": 1,
+      "position": [
+        440,
+        300
+      ],
+      "parameters": {
+        "operation": "fromJson",
+        "options": {}
+      }
+    },
+    {
+      "id": "98803599-2549-5ac8-9a2d-d42e65a6555f",
+      "name": "Sampler (first 40 + last 20)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        660,
+        300
+      ],
+      "parameters": {
+        "jsCode": "// Trigger & Sampler — \"Run Once for All Items\"\n// Input : one item from Extract From File → { data: [session, session, ...] }\n// Output: one n8n item per session, carrying a bounded sample (first 40 + last 20 turns)\nconst HEAD_TURNS = 40;\nconst TAIL_TURNS = 20;\n\nconst sessions = $input.all().flatMap(({ json }) =>\n  Array.isArray(json.data) ? json.data : [json.data ?? json]\n);\n\nreturn sessions.map((session) => {\n  const turns = Array.isArray(session.transcript) ? session.transcript : [];\n  const truncated = turns.length > HEAD_TURNS + TAIL_TURNS;\n\n  // Short transcripts are taken whole so no turn is ever duplicated by overlapping slices\n  const sample = truncated\n    ? [...turns.slice(0, HEAD_TURNS), ...turns.slice(-TAIL_TURNS)]\n    : turns;\n\n  return {\n    json: {\n      session_id: session.id,\n      title: session.title ?? null,\n      created_at: session.created_at ?? null,\n      participants: session.participants ?? [],\n      total_turns: turns.length,\n      sampled_turns: sample.length,\n      truncated,\n      sample,\n      session, // full raw session, needed later by the Dual-Stream Parser\n    },\n  };\n});\n"
+      }
+    },
+    {
+      "id": "1d00579b-6081-584e-b08d-037c59caadf1",
+      "name": "Build Classifier Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        880,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Classifier Request — \"Run Once for Each Item\"\n// Turns the bounded sample into an Ollama /api/chat request body.\nconst MODEL = 'qwen3:4b-instruct';\n\nconst roster = $json.participants\n  .map((p) => `- ${p.name} (${p.is_team_member ? 'internal team member' : 'external participant'})`)\n  .join('\\n');\n\nconst dialogue = $json.sample\n  .map((t) => `[${t.timestamp}] ${t.speaker}: ${t.text}`)\n  .join('\\n');\n\nconst systemPrompt = `You are the ingestion gate for an executive-coaching firm's knowledge base.\nRead the meeting sample and classify the meeting into exactly one category:\n\n- Client Coaching: a coach working with an external client on leadership, wellbeing, behaviour, delegation or professional growth.\n- Internal Operations: internal team members working on the business itself, such as engineering, tooling, CRM, integrations, sprints or processes.\n- Sales Discovery: a sales conversation with a prospect about needs, pricing, budget, packages or contracts.\n- Other: a meeting that fits none of the categories above.\n\nRespond with a single JSON object with exactly these keys:\n{\"meeting_type\": \"Client Coaching\" | \"Internal Operations\" | \"Sales Discovery\" | \"Other\",\n \"confidence_score\": a number from 0.0 to 1.0 expressing how clearly the meeting matches the chosen category,\n \"summary\": \"one or two sentences describing what the meeting was about\"}`;\n\nconst userPrompt = `Meeting title: ${$json.title}\nParticipants:\n${roster}\n\nTranscript sample (${$json.sampled_turns} of ${$json.total_turns} turns):\n${dialogue}`;\n\nreturn {\n  json: {\n    ...$json,\n    llm_request: {\n      model: MODEL,\n      stream: false,\n      format: 'json',\n      options: { temperature: 0, num_ctx: 8192 },\n      messages: [\n        { role: 'system', content: systemPrompt },\n        { role: 'user', content: userPrompt },\n      ],\n    },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "7e6874ec-f458-5909-9646-7a8a3f98f8fe",
+      "name": "Classify Meeting (Ollama)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1100,
+        300
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "id": "b84f83d6-4244-55ce-a699-b9f7d490e534",
+      "name": "Safe Parse Classification",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1320,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Safe Parse Classification — \"Run Once for Each Item\"\n// Never throws. Any malformed / missing / out-of-range output collapses to\n// { meeting_type: \"Other\", confidence_score: 0 }, which the gate rejects (fail-closed).\nconst ALLOWED_TYPES = ['Client Coaching', 'Internal Operations', 'Sales Discovery', 'Other'];\nconst FALLBACK = { meeting_type: 'Other', confidence_score: 0, summary: '' };\n\nconst source = $('Build Classifier Request').item.json;\nconst raw = $json.message?.content ?? '';\n\nfunction tryParse(text) {\n  try {\n    return JSON.parse(text);\n  } catch {\n    // Recover a JSON object wrapped in prose or code fences\n    const match = String(text).match(/\\{[\\s\\S]*\\}/);\n    if (!match) return null;\n    try {\n      return JSON.parse(match[0]);\n    } catch {\n      return null;\n    }\n  }\n}\n\nconst parsed = tryParse(raw);\nlet result = { ...FALLBACK };\nlet parse_status = 'ok';\n\nif (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {\n  parse_status = 'invalid_json';\n} else {\n  const type = ALLOWED_TYPES.find(\n    (t) => t.toLowerCase() === String(parsed.meeting_type ?? '').trim().toLowerCase()\n  );\n  const score = Number(parsed.confidence_score);\n\n  if (!type) {\n    parse_status = 'unknown_meeting_type';\n  } else if (!Number.isFinite(score) || score < 0 || score > 1) {\n    // Out-of-range scores (e.g. 7, 85) are ambiguous, so they fail closed instead of being clamped\n    parse_status = 'invalid_confidence';\n  } else {\n    result = {\n      meeting_type: type,\n      confidence_score: score,\n      summary: typeof parsed.summary === 'string' ? parsed.summary.trim() : '',\n    };\n  }\n}\n\n// Deterministic consistency check: a coaching session needs an external client.\n// If every participant is an internal team member, the LLM's \"Client Coaching\"\n// label is overridden, because self-reported LLM confidence is not calibrated.\nconst hasExternalClient = (source.participants ?? []).some((p) => p.is_team_member === false);\nif (result.meeting_type === 'Client Coaching' && !hasExternalClient) {\n  result = { ...result, meeting_type: 'Internal Operations', confidence_score: 0 };\n  parse_status = 'overridden_no_external_client';\n}\n\nconst { llm_request, ...session } = source;\n\nreturn {\n  json: {\n    ...session,\n    ...result,\n    parse_status,\n    raw_llm_output: parse_status === 'ok' ? undefined : raw,\n  },\n};\n"
+      }
+    },
+    {
+      "id": "86458d3d-118f-5d16-9b5a-addd94ccdef9",
+      "name": "Ingestion Gate",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        1540,
+        300
+      ],
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "strict",
+                  "version": 2
+                },
+                "conditions": [
+                  {
+                    "id": "is-coaching",
+                    "leftValue": "={{ $json.meeting_type }}",
+                    "rightValue": "Client Coaching",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  },
+                  {
+                    "id": "is-confident",
+                    "leftValue": "={{ $json.confidence_score }}",
+                    "rightValue": 0.8,
+                    "operator": {
+                      "type": "number",
+                      "operation": "gte"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              },
+              "renameOutput": true,
+              "outputKey": "Ingest"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "Archive"
+        }
+      }
+    },
+    {
+      "id": "e740974c-210b-5d9a-b8ba-7a443f0339e7",
+      "name": "Build Framework Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1780,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Framework Request — \"Run Once for Each Item\"\n// Approved sessions only. Asks the LLM for (a) a dense conceptual takeaway of the\n// coaching framework (Stream 1) and (b) a retrieval context — the client's situation\n// and the questions a leader would ask — used only to enrich the embedding text.\n// Stream 2 (voice samples) is extracted deterministically, without the LLM.\nconst MODEL = 'qwen3:4b-instruct';\n\nconst dialogue = $json.session.transcript\n  .map((t) => `[${t.timestamp}] ${t.speaker}: ${t.text}`)\n  .join('\\n');\n\nconst systemPrompt = `You distill coaching sessions into reusable knowledge-base entries.\n\n1. Identify the coaching framework the coach teaches and write a dense conceptual takeaway:\n   the framework's name, the core principle behind it, the diagnostic or decision logic it uses,\n   and how the client applies it. Keep the coach's own terminology. 80-150 words, third person.\n2. Describe the client's situation in 1-2 general sentences (roles, not names), as a leader would describe their own problem.\n3. Write 4 short questions a leader in that situation would ask a coach, in the leader's own words.\n\nRespond with a single JSON object:\n{\"framework_name\": \"name of the framework as the coach calls it\",\n \"takeaway\": \"the dense conceptual takeaway\",\n \"situation\": \"the client's situation in general terms\",\n \"client_questions\": [\"question 1\", \"question 2\", \"question 3\", \"question 4\"]}`;\n\nconst userPrompt = `Session: ${$json.title} (${$json.session_id})\nTranscript:\n${dialogue}`;\n\nreturn {\n  json: {\n    ...$json,\n    llm_request: {\n      model: MODEL,\n      stream: false,\n      format: 'json',\n      options: { temperature: 0, num_ctx: 8192 },\n      messages: [\n        { role: 'system', content: systemPrompt },\n        { role: 'user', content: userPrompt },\n      ],\n    },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "836c9bfc-22cb-55c2-bf54-dd3700c39fd4",
+      "name": "Extract Framework (Ollama)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2000,
+        160
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "id": "a019855e-d876-5654-94e5-912754f6ffaa",
+      "name": "Dual-Stream Parser",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2220,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Dual-Stream Parser — \"Run Once for Each Item\"\n// Splits one approved session into two arrays:\n//   framework    : the LLM's dense conceptual takeaway (safely parsed)\n//   voice_sample : the coach's verbatim turns, packed into 400–700 char chunks\nconst MIN_CHARS = 400;\nconst MAX_CHARS = 700;\n\nconst src = $('Build Framework Request').item.json;\nconst { session } = src;\n\n// ---------- Stream 1: framework ----------\nfunction parseFramework(raw) {\n  const text = String(raw ?? '');\n  const candidates = [text, text.match(/\\{[\\s\\S]*\\}/)?.[0]].filter(Boolean);\n  for (const c of candidates) {\n    try {\n      const obj = JSON.parse(c);\n      const str = (v) => (typeof v === 'string' ? v.trim() : '');\n      const name = str(obj.framework_name);\n      const takeaway = str(obj.takeaway);\n      if (!name || !takeaway) continue;\n      return {\n        name,\n        takeaway,\n        situation: str(obj.situation),\n        questions: Array.isArray(obj.client_questions)\n          ? obj.client_questions.map(str).filter(Boolean).slice(0, 6)\n          : [],\n      };\n    } catch {}\n  }\n  return null; // no usable framework → stream stays empty rather than storing junk\n}\n\nconst fw = parseFramework($json.message?.content);\nconst framework = fw\n  ? [{ content: `Framework: ${fw.name}\\n${fw.takeaway}`, framework_name: fw.name }]\n  : [];\n\n// Contextual enrichment: a session-level header prepended to the text that is EMBEDDED\n// (never to the stored content), so short user questions land near the right session.\nconst retrieval_context = fw && (fw.situation || fw.questions.length)\n  ? { situation: fw.situation, client_questions: fw.questions }\n  : null;\nconst embedHeader = retrieval_context\n  ? [\n      retrieval_context.situation && `Situation: ${retrieval_context.situation}`,\n      retrieval_context.client_questions.length && `Questions this addresses: ${retrieval_context.client_questions.join(' ')}`,\n    ].filter(Boolean).join('\\n') + '\\n\\n'\n  : '';\n\n// ---------- Stream 2: voice_sample ----------\n// The coach is the internal team member; client turns are dropped entirely.\nconst coachNames = new Set(\n  session.participants.filter((p) => p.is_team_member).map((p) => p.name)\n);\nconst coachTurns = session.transcript.filter((t) => coachNames.has(t.speaker));\n\n// Sentence units keep the coach's phrasing intact: chunks never cut mid-sentence.\nconst splitSentences = (text) =>\n  (text.match(/[^.!?]+[.!?]+[\"')\\]]*|[^.!?]+$/g) ?? [text]).map((s) => s.trim()).filter(Boolean);\n\nconst units = coachTurns.flatMap((turn) =>\n  splitSentences(turn.text).map((sentence, i) => ({ sentence, timestamp: turn.timestamp, turnStart: i === 0 }))\n);\n\n// A new turn starts on a new line so the original turn rhythm stays visible.\nconst render = (us) =>\n  us.map((u, i) => (i === 0 ? '' : u.turnStart ? '\\n' : ' ') + u.sentence).join('');\n\n// Greedy packing: close a chunk once the next sentence would push it past MAX_CHARS.\nconst groups = [];\nlet current = [];\nfor (const unit of units) {\n  if (current.length && render([...current, unit]).length > MAX_CHARS && render(current).length >= MIN_CHARS) {\n    groups.push(current);\n    current = [];\n  }\n  current.push(unit);\n}\nif (current.length) groups.push(current);\n\n// A short tail is merged into, or rebalanced with, the previous chunk.\nif (groups.length > 1 && render(groups.at(-1)).length < MIN_CHARS) {\n  const merged = [...groups.at(-2), ...groups.at(-1)];\n  groups.splice(-2, 2);\n  if (render(merged).length <= MAX_CHARS) {\n    groups.push(merged);\n  } else {\n    // Split at the sentence boundary closest to the character midpoint\n    const half = render(merged).length / 2;\n    let cut = 1;\n    while (cut < merged.length - 1 && render(merged.slice(0, cut + 1)).length <= half) cut++;\n    groups.push(merged.slice(0, cut), merged.slice(cut));\n  }\n}\n\nconst voice_sample = groups.map((g) => ({\n  content: render(g),\n  turn_timestamps: [...new Set(g.map((u) => u.timestamp))],\n}));\n\n// ---------- Output: one item per session, with both streams ----------\nconst base = {\n  title: src.title,\n  session_created_at: src.created_at,\n  coach: [...coachNames].join(', '),\n  clients: session.participants.filter((p) => !p.is_team_member).map((p) => p.name),\n  meeting_type: src.meeting_type,\n  confidence_score: src.confidence_score,\n  source: 'mock_transcripts.json',\n  retrieval_context,\n};\n\nconst chunks = [\n  ...framework.map((c, i) => ({\n    stream_type: 'framework', chunk_index: i, content: c.content,\n    metadata: { ...base, framework_name: c.framework_name, char_count: c.content.length },\n  })),\n  ...voice_sample.map((c, i) => ({\n    stream_type: 'voice_sample', chunk_index: i, content: c.content,\n    metadata: { ...base, turn_timestamps: c.turn_timestamps, char_count: c.content.length },\n  })),\n];\n\nreturn {\n  json: {\n    session_id: src.session_id,\n    framework: framework.map((c) => c.content),\n    voice_sample: voice_sample.map((c) => c.content),\n    framework_parse_status: fw ? 'ok' : 'invalid_json',\n    chunks,\n    embed_request: { model: 'bge-m3', input: chunks.map((c) => embedHeader + c.content) },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "2c0eb357-958c-5e77-96b1-bf65ef37b790",
+      "name": "Embed Chunks (bge-m3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2440,
+        160
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.embed_request) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "id": "0054e38c-2766-5c5e-b561-168c7f0d023e",
+      "name": "Attach Embeddings",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2660,
+        160
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Attach Embeddings — \"Run Once for Each Item\"\n// Pairs each chunk with its bge-m3 vector and validates shape before anything touches the DB.\nconst DIMS = 1024;\n\nconst parsed = $('Dual-Stream Parser').item.json;\nconst vectors = $json.embeddings ?? [];\n\nif (vectors.length !== parsed.chunks.length) {\n  throw new Error(`${parsed.session_id}: expected ${parsed.chunks.length} embeddings, got ${vectors.length}`);\n}\n\nconst rows = parsed.chunks.map((chunk, i) => {\n  const v = vectors[i];\n  if (!Array.isArray(v) || v.length !== DIMS || !v.every(Number.isFinite)) {\n    throw new Error(`${parsed.session_id} ${chunk.stream_type}#${chunk.chunk_index}: invalid ${DIMS}-dim vector`);\n  }\n  return {\n    session_id: parsed.session_id,\n    stream_type: chunk.stream_type,\n    chunk_index: chunk.chunk_index,\n    content: chunk.content,\n    metadata: { ...chunk.metadata, embedding_model: 'bge-m3' },\n    embedding: `[${v.join(',')}]`, // pgvector text literal, cast to vector in SQL\n  };\n});\n\nreturn { json: { session_id: parsed.session_id, row_count: rows.length, rows } };\n"
+      }
+    },
+    {
+      "id": "aa3e1dce-35fc-5e70-9f2b-b638c61cddaf",
+      "name": "Upsert knowledge_vault",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        2880,
+        160
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH input AS (\n  SELECT *\n  FROM jsonb_to_recordset($1::jsonb) AS r(\n    session_id text, stream_type text, chunk_index int,\n    content text, metadata jsonb, embedding text)\n),\nupserted AS (\n  INSERT INTO knowledge_vault (session_id, stream_type, chunk_index, content, metadata, embedding)\n  SELECT session_id, stream_type, chunk_index, content, metadata, embedding::vector\n  FROM input\n  ON CONFLICT (session_id, stream_type, chunk_index) DO UPDATE SET\n    content    = EXCLUDED.content,\n    metadata   = EXCLUDED.metadata,\n    embedding  = EXCLUDED.embedding,\n    created_at = now()\n  RETURNING stream_type\n),\npruned AS (\n  DELETE FROM knowledge_vault kv\n  WHERE kv.session_id = $2\n    AND NOT EXISTS (SELECT 1 FROM input i\n                    WHERE i.stream_type = kv.stream_type AND i.chunk_index = kv.chunk_index)\n  RETURNING 1\n)\nSELECT $2 AS session_id,\n       (SELECT count(*) FROM upserted WHERE stream_type = 'framework')    AS framework_chunks,\n       (SELECT count(*) FROM upserted WHERE stream_type = 'voice_sample') AS voice_chunks,\n       (SELECT count(*) FROM pruned)                                       AS pruned_stale;",
+        "options": {
+          "queryReplacement": "={{ [ JSON.stringify($json.rows), $json.session_id ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgvectorRagCred1",
+          "name": "Postgres (rag)"
+        }
+      }
+    },
+    {
+      "id": "41aa440f-3429-5167-bb81-8c996983edca",
+      "name": "Archive Rejected Session",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        1780,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO archived_sessions\n  (session_id, title, meeting_type, confidence_score, summary, participants, session_created_at)\nVALUES ($1, $2, $3, $4, $5, $6::jsonb, $7::timestamptz)\nON CONFLICT (session_id) DO UPDATE SET\n  title              = EXCLUDED.title,\n  meeting_type       = EXCLUDED.meeting_type,\n  confidence_score   = EXCLUDED.confidence_score,\n  summary            = EXCLUDED.summary,\n  participants       = EXCLUDED.participants,\n  session_created_at = EXCLUDED.session_created_at,\n  archived_at        = now()\nRETURNING session_id, meeting_type, confidence_score, archived_at;",
+        "options": {
+          "queryReplacement": "={{ [ $json.session_id, $json.title, $json.meeting_type, $json.confidence_score, $json.summary, JSON.stringify($json.participants), $json.created_at ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgvectorRagCred1",
+          "name": "Postgres (rag)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Transcripts File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Transcripts File": {
+      "main": [
+        [
+          {
+            "node": "Parse JSON File",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse JSON File": {
+      "main": [
+        [
+          {
+            "node": "Sampler (first 40 + last 20)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sampler (first 40 + last 20)": {
+      "main": [
+        [
+          {
+            "node": "Build Classifier Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Classifier Request": {
+      "main": [
+        [
+          {
+            "node": "Classify Meeting (Ollama)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Classify Meeting (Ollama)": {
+      "main": [
+        [
+          {
+            "node": "Safe Parse Classification",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Safe Parse Classification": {
+      "main": [
+        [
+          {
+            "node": "Ingestion Gate",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Framework Request": {
+      "main": [
+        [
+          {
+            "node": "Extract Framework (Ollama)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract Framework (Ollama)": {
+      "main": [
+        [
+          {
+            "node": "Dual-Stream Parser",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dual-Stream Parser": {
+      "main": [
+        [
+          {
+            "node": "Embed Chunks (bge-m3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Chunks (bge-m3)": {
+      "main": [
+        [
+          {
+            "node": "Attach Embeddings",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Attach Embeddings": {
+      "main": [
+        [
+          {
+            "node": "Upsert knowledge_vault",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Ingestion Gate": {
+      "main": [
+        [
+          {
+            "node": "Build Framework Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Archive Rejected Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
