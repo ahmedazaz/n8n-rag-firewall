@@ -1,0 +1,76 @@
+# One-command startup:  docker compose up -d
+# Works without a .env file (local-only defaults below); copy .env.example to .env to override.
+# Ollama runs on the HOST (see README) and is reached via host.docker.internal.
+
+x-db-env: &db-env
+  DB_TYPE: postgresdb
+  DB_POSTGRESDB_HOST: postgres
+  DB_POSTGRESDB_PORT: 5432
+  DB_POSTGRESDB_DATABASE: ${POSTGRES_DB:-n8n}
+  DB_POSTGRESDB_USER: ${POSTGRES_USER:-n8n}
+  DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-n8n_local_password}
+  N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:-local-dev-encryption-key-change-me}
+  GENERIC_TIMEZONE: ${TZ:-UTC}
+  TZ: ${TZ:-UTC}
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-n8n}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-n8n_local_password}
+      POSTGRES_DB: ${POSTGRES_DB:-n8n}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    # No host port: n8n reaches Postgres over the compose network, and this avoids
+    # clashing with a Postgres already running on the host. Use `docker compose exec postgres psql`.
+    healthcheck:
+      # Over TCP and against the rag schema: only healthy once init.sql has fully finished
+      test: ["CMD-SHELL", "PGPASSWORD=$${POSTGRES_PASSWORD} psql -h 127.0.0.1 -U $${POSTGRES_USER} -d rag -tAc 'SELECT 1 FROM knowledge_vault LIMIT 1'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # One-shot bootstrap: creates the Postgres credential (from env, no secrets in git),
+  # imports both workflows with stable IDs and publishes Workflow B's webhook.
+  # Runs once per fresh volume; force a re-import with:
+  #   docker compose run --rm -e FORCE_IMPORT=true n8n-import
+  n8n-import:
+    image: n8nio/n8n:2.47.7
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *db-env
+      RAG_DB_NAME: rag
+      RAG_DB_USER: ${POSTGRES_USER:-n8n}
+      RAG_DB_PASSWORD: ${POSTGRES_PASSWORD:-n8n_local_password}
+    entrypoint: ["/bin/sh", "/scripts/n8n-bootstrap.sh"]
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./workflows:/workflows:ro
+      - ./scripts/n8n-bootstrap.sh:/scripts/n8n-bootstrap.sh:ro
+    restart: "no"
+
+  n8n:
+    image: n8nio/n8n:2.47.7
+    restart: unless-stopped
+    depends_on:
+      n8n-import:
+        condition: service_completed_successfully
+    environment:
+      <<: *db-env
+      N8N_RESTRICT_FILE_ACCESS_TO: /data
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets n8n reach host Ollama on Linux too
+    ports:
+      - "5678:5678"
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./data:/data:ro
+
+volumes:
+  pgdata:
+  n8n_data:
