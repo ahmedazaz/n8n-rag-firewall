@@ -1,0 +1,402 @@
+{
+  "id": "GatedRetrievalB1",
+  "name": "B — Gated Retrieval & Persona Synthesis",
+  "nodes": [
+    {
+      "id": "eff7511b-10a7-5275-bc92-c1d5e034a019",
+      "name": "Chat Trigger",
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        200
+      ],
+      "parameters": {
+        "options": {}
+      },
+      "webhookId": "4cf4b714-929d-51f6-8211-a1f108b15dbf"
+    },
+    {
+      "id": "2275ea25-e438-5d8f-854a-1ecb140743c4",
+      "name": "Webhook (POST /ask)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        420
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "ask",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "webhookId": "2d340f89-bfc0-59db-a086-c7546b80e8c7"
+    },
+    {
+      "id": "c18ce2ce-360b-56cd-b3a3-09f6c24453b8",
+      "name": "Intent Router",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        300
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Intent Router — \"Run Once for Each Item\"\n// Accepts input from either trigger (Chat Trigger → chatInput, Webhook → body.question)\n// and intercepts *pure* greetings before any embedding or database work.\nconst question = String(\n  $json.chatInput ?? $json.body?.question ?? $json.body?.chatInput ?? ''\n).trim();\n\n// Whole-message match only: \"Hi!\" is a greeting, \"Hi, how do I give feedback?\" is a question.\nconst GREETING = /^(hi|hello|hey|hiya|howdy|greetings|good\\s+(morning|afternoon|evening)|salam|assalamu\\s+alaikum|marhaba|مرحبا|اهلا|السلام عليكم)(\\s+(there|sara|dr\\.?\\s*sara|dr\\.?\\s*hegy))?[\\s!.,?]*$/i;\n\nconst intent = question === '' || GREETING.test(question) ? 'greeting' : 'question';\n\nreturn { json: { question, intent } };\n"
+      }
+    },
+    {
+      "id": "fe157f50-71d3-5951-8044-2cfa6f28d2e0",
+      "name": "Is Greeting?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        460,
+        300
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "is-greeting",
+              "leftValue": "={{ $json.intent }}",
+              "rightValue": "greeting",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "b05f0a1e-7cda-5976-8ad6-6145db06ffd0",
+      "name": "Static Greeting",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        700,
+        140
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "503cca2d-7569-586b-a8cd-52b50e717d61",
+              "name": "route",
+              "value": "greeting",
+              "type": "string"
+            },
+            {
+              "id": "a5233b30-64d2-51de-9cc6-962a98c01242",
+              "name": "output",
+              "value": "Hello! I'm Dr. Sara Hegy's coaching assistant. Ask me about leadership, delegation, accountability or giving difficult feedback, and I'll answer from documented coaching frameworks.",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "85e55409-ed6f-57b5-975e-d880a9d4aa18",
+      "name": "Embed Question (bge-m3)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        700,
+        420
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/embed",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'bge-m3', input: $json.question }) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "id": "7e06bb6f-fc89-592a-b824-a6de210dc687",
+      "name": "Gated Vector Search",
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.5,
+      "position": [
+        920,
+        420
+      ],
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "WITH q AS (\n  SELECT $1::vector(1024) AS v\n),\nframeworks AS (\n  SELECT kv.session_id, kv.stream_type, kv.chunk_index, kv.content, kv.metadata,\n         1 - (kv.embedding <=> q.v) AS similarity\n  FROM knowledge_vault kv, q\n  WHERE kv.stream_type = 'framework'\n    AND 1 - (kv.embedding <=> q.v) >= 0.50  -- framework gate\n  ORDER BY kv.embedding <=> q.v\n  LIMIT 2\n),\nvoice_samples AS (\n  SELECT kv.session_id, kv.stream_type, kv.chunk_index, kv.content, kv.metadata,\n         1 - (kv.embedding <=> q.v) AS similarity\n  FROM knowledge_vault kv, q\n  WHERE kv.stream_type = 'voice_sample'\n    AND 1 - (kv.embedding <=> q.v) >= 0.50  -- voice_sample gate\n  ORDER BY kv.embedding <=> q.v\n  LIMIT 2\n)\nSELECT\n  COALESCE((SELECT jsonb_agg(f ORDER BY f.similarity DESC) FROM frameworks f), '[]'::jsonb)    AS frameworks,\n  COALESCE((SELECT jsonb_agg(v ORDER BY v.similarity DESC) FROM voice_samples v), '[]'::jsonb) AS voice_samples,\n  (SELECT round(max(1 - (kv.embedding <=> q.v))::numeric, 4) FROM knowledge_vault kv, q\n     WHERE kv.stream_type = 'framework')    AS best_framework_similarity,\n  (SELECT round(max(1 - (kv.embedding <=> q.v))::numeric, 4) FROM knowledge_vault kv, q\n     WHERE kv.stream_type = 'voice_sample') AS best_voice_similarity;",
+        "options": {
+          "queryReplacement": "={{ [ '[' + $json.embeddings[0].join(',') + ']' ] }}"
+        }
+      },
+      "credentials": {
+        "postgres": {
+          "id": "pgvectorRagCred1",
+          "name": "Postgres (rag)"
+        }
+      }
+    },
+    {
+      "id": "6507568a-fbd7-5979-908e-ab242882483f",
+      "name": "Any Chunk Passed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1140,
+        420
+      ],
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "has-chunks",
+              "leftValue": "={{ $json.frameworks.length + $json.voice_samples.length }}",
+              "rightValue": 0,
+              "operator": {
+                "type": "number",
+                "operation": "gt"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      }
+    },
+    {
+      "id": "5a7fdb48-548d-5eeb-9972-cad3d79ba676",
+      "name": "Build Persona Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1380,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Build Persona Prompt — \"Run Once for Each Item\"\n// Only reached when at least one chunk passed the SQL gate.\n// Frameworks supply WHAT to say; voice samples supply HOW Dr. Sara says it.\nconst MODEL = 'qwen3:4b-instruct';\nconst { question } = $('Intent Router').item.json;\nconst { frameworks, voice_samples } = $json;\n\nconst frameworkNotes = frameworks.length\n  ? frameworks.map((f) => `[${f.session_id}] ${f.content}`).join('\\n\\n')\n  : '(none retrieved)';\nconst voiceNotes = voice_samples.length\n  ? voice_samples.map((v) => `[${v.session_id}] \"${v.content}\"`).join('\\n\\n')\n  : '(none retrieved)';\n\nconst systemPrompt = `You are Dr. Sara Hegy, an executive coach. You answer a leader's question using the coaching frameworks in FRAMEWORK NOTES, and you speak exactly the way the VOICE SAMPLES show you speaking.\n\nHow you answer:\n- Open by reframing the leader's problem as a system or architecture issue, in one or two short, direct sentences.\n- Name the framework from FRAMEWORK NOTES and explain its logic in plain language, using its own terms.\n- Speak to the leader as \"you\", in short declarative sentences, with the vocabulary and rhythm of the VOICE SAMPLES.\n- Close with one concrete action the leader takes this week.\n- Keep the answer between 120 and 180 words.\nThe first exchange below is a format example built on a demo framework; your real answer draws only on the notes in the final message.`;\n\n// Positive few-shot: one complete example of the target shape and tone.\nconst exampleUser = `FRAMEWORK NOTES:\n[DEMO] Framework: The Decision Ledger\nEvery recurring decision is logged with an owner and a decision rule. Escalations drop when ownership is explicit; the leader reviews the ledger weekly instead of the decisions themselves.\n\nVOICE SAMPLES:\n[DEMO] \"Look, your inbox is not the problem. Your decision rights are. When ownership is fuzzy, everything floats up to you.\"\n\nQUESTION: My managers escalate every small decision to me. What should I do?`;\n\nconst exampleAssistant = `Look, the escalations are not a people problem. They are a decision-rights problem. When ownership is fuzzy, every choice floats up to your desk, and your calendar pays the price.\n\nWe fix this with the Decision Ledger. You list the decisions that keep landing on you, and for each one you assign a clear owner and a simple decision rule. Once the rule is written down, your managers stop asking permission and start applying the standard. You move from approving decisions to reviewing the ledger once a week.\n\nThis week, pull the last ten escalations from your inbox. Give each one an owner and a one-line rule, and share the ledger with your managers on Monday.`;\n\nconst userPrompt = `FRAMEWORK NOTES:\n${frameworkNotes}\n\nVOICE SAMPLES:\n${voiceNotes}\n\nQUESTION: ${question}`;\n\nreturn {\n  json: {\n    question,\n    frameworks,\n    voice_samples,\n    llm_request: {\n      model: MODEL,\n      stream: false,\n      options: { temperature: 0.3, num_ctx: 8192 },\n      messages: [\n        { role: 'system', content: systemPrompt },\n        { role: 'user', content: exampleUser },\n        { role: 'assistant', content: exampleAssistant },\n        { role: 'user', content: userPrompt },\n      ],\n    },\n  },\n};\n"
+      }
+    },
+    {
+      "id": "21266e24-67ce-515a-b82f-4f86ad2bf66d",
+      "name": "Persona LLM (Ollama)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1600,
+        320
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "http://host.docker.internal:11434/api/chat",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.llm_request) }}",
+        "options": {
+          "timeout": 300000
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 2
+    },
+    {
+      "id": "7ef4b73f-bc17-5be9-a945-662502f79cf2",
+      "name": "Format Answer",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1820,
+        320
+      ],
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// Format Answer — \"Run Once for Each Item\"\nconst prompt = $('Build Persona Prompt').item.json;\nconst answer = String($json.message?.content ?? '').trim();\n\nconst sources = [...prompt.frameworks, ...prompt.voice_samples].map((c) => ({\n  session_id: c.session_id,\n  stream_type: c.stream_type,\n  chunk_index: c.chunk_index,\n  similarity: Number(Number(c.similarity).toFixed(4)),\n}));\n\nconst sourceLine = sources\n  .map((s) => `${s.session_id} ${s.stream_type}#${s.chunk_index} (${s.similarity.toFixed(3)})`)\n  .join(', ');\n\nreturn {\n  json: {\n    route: 'persona_answer',\n    question: prompt.question,\n    output: `${answer}\\n\\nSources: ${sourceLine}`,\n    answer,\n    sources,\n  },\n};\n"
+      }
+    },
+    {
+      "id": "8c74268a-0bfe-5364-ba4a-2b63c70ffa43",
+      "name": "Circuit Breaker Fallback",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        1380,
+        540
+      ],
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "f2871ca0-264d-5448-be74-53594bbdaca0",
+              "name": "route",
+              "value": "circuit_breaker",
+              "type": "string"
+            },
+            {
+              "id": "16cc14eb-a3e7-5339-ba14-1a4012bc8f63",
+              "name": "output",
+              "value": "No documented coaching frameworks match this topic.",
+              "type": "string"
+            },
+            {
+              "id": "49bb1deb-70db-5dce-b246-12b0113893b5",
+              "name": "best_framework_similarity",
+              "value": "={{ $json.best_framework_similarity }}",
+              "type": "string"
+            },
+            {
+              "id": "0afd33dc-7728-54bd-93ee-9504e0ae8312",
+              "name": "best_voice_similarity",
+              "value": "={{ $json.best_voice_similarity }}",
+              "type": "string"
+            }
+          ]
+        },
+        "options": {}
+      }
+    }
+  ],
+  "connections": {
+    "Chat Trigger": {
+      "main": [
+        [
+          {
+            "node": "Intent Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook (POST /ask)": {
+      "main": [
+        [
+          {
+            "node": "Intent Router",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Intent Router": {
+      "main": [
+        [
+          {
+            "node": "Is Greeting?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Greeting?": {
+      "main": [
+        [
+          {
+            "node": "Static Greeting",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Embed Question (bge-m3)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed Question (bge-m3)": {
+      "main": [
+        [
+          {
+            "node": "Gated Vector Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gated Vector Search": {
+      "main": [
+        [
+          {
+            "node": "Any Chunk Passed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Any Chunk Passed?": {
+      "main": [
+        [
+          {
+            "node": "Build Persona Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Circuit Breaker Fallback",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Persona Prompt": {
+      "main": [
+        [
+          {
+            "node": "Persona LLM (Ollama)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Persona LLM (Ollama)": {
+      "main": [
+        [
+          {
+            "node": "Format Answer",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {}
+}
